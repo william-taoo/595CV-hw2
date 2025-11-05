@@ -9,7 +9,7 @@ from PIL import Image
 import time
 
 '''
-Reproducing a Mini DenseNet for classifying 4 classes from
+Creating a simple CNN for classifying 4 classes from
 the ImageNet dataset. We are classifying cats, bikes,
 bananas, and elephants.
 '''
