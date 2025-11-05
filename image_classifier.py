@@ -2,10 +2,11 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
-from torchvision import datasets, transforms
+from torchvision import transforms
 import os
 import zipfile
 from PIL import Image
+import time
 
 '''
 Reproducing a Mini DenseNet for classifying 4 classes from
@@ -13,112 +14,70 @@ the ImageNet dataset. We are classifying cats, bikes,
 bananas, and elephants.
 '''
 
-class DenseLayer(nn.Module):
-    def __init__(self, in_channels, growth_rate):
+class ConvolutionBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
         super().__init__()
-        self.bn1 = nn.BatchNorm2d(in_channels)
-        self.conv1 = nn.Conv2d(
-            in_channels=in_channels,
-            out_channels=4 * growth_rate,
-            kernel_size=1,
-            bias=False
-        )
-        self.bn2 = nn.BatchNorm2d(4 * growth_rate)
-        self.conv2 = nn.Conv2d(
-            in_channels=4 * growth_rate,
-            out_channels=growth_rate,
-            kernel_size=3,
-            padding=1,
-            bias=False
-        )
+
+        if padding is None:
+            padding = (kernel_size - 1) // 2
+        
+        # Convolution layer
+        self.convolution = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=False)
+        
+        # Normalizes the output of the convolution layer
+        self.batch_norm = nn.BatchNorm2d(out_channels)
+
+        self.activation = nn.ReLU() 
 
     def forward(self, x):
-        out = self.conv1(self.bn1(x))
-        out = self.conv2(self.bn2(out))
-        return torch.cat([x, out], dim=1)
-
-class DenseBlock(nn.Module):
-    def __init__(self, num_layers, in_channels, growth_rate):
-        super().__init__()
-        layers = []
-        for i in range(num_layers):
-            layers.append(DenseLayer(
-                in_channels + i * growth_rate,
-                growth_rate
-            ))
-        self.block = nn.Sequential(*layers) # Unpack list to Sequential
-
-    def forward(self, x):
-        return self.block(x)
+        return self.activation(self.batch_norm(self.convolution(x)))
     
-class TransitionLayer(nn.Module):
-    '''
-    The transition layer reduces the number of 
-    channels and dimensions
-    '''
-    def __init__(self, in_channels):
+class CustomCNN(nn.Module):
+    def __init__(self):
         super().__init__()
-        out_channels = in_channels // 2
-        self.transition = nn.Sequential(
-            nn.BatchNorm2d(in_channels),
-            nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size = 1,
-                bias = False
-            ),
-            nn.AvgPool2d(kernel_size=2, stride=2)
+
+        self.features = nn.Sequential(
+            # Start with 3 input channels (RGB) -> 64 output channels
+            ConvolutionBlock(in_channels=3, 
+                            out_channels=64, 
+                            kernel_size=7, 
+                            stride=2, 
+                            padding=3),
+            nn.MaxPool2d(kernel_size=2, stride=2), # Downsample by 2
+
+            ConvolutionBlock(in_channels=64, 
+                            out_channels=128,
+                            kernel_size=3,
+                            stride=1,
+                            padding=1),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            ConvolutionBlock(in_channels=128,
+                            out_channels=64,
+                            kernel_size=3,
+                            stride=1,
+                            padding=1),
+            ConvolutionBlock(in_channels=64,
+                            out_channels=32,
+                            kernel_size=3,
+                            stride=1,
+                            padding=1),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            nn.AdaptiveAvgPool2d((1, 1))
+        )
+
+        # Fully connected layer (flatten to 1d vector)
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(32, 4),
         )
 
     def forward(self, x):
-        return self.transition(x)
-
-class DenseNet(nn.Module):
-    def __init__(self, num_classes, growth_rate):
-        super().__init__()
-        num_channels = 64
-
-        self.initial_conv = nn.Conv2d(
-            in_channels=3,
-            out_channels=num_channels,
-            kernel_size=7,
-            stride=2,
-            padding=3
-        )
-
-        # Dense Block 1
-        self.db1 = DenseBlock(
-            num_layers=4,
-            in_channels=num_channels,
-            growth_rate=growth_rate
-        )
-        num_channels += 4 * growth_rate # Update channel count
-        self.trans1 = TransitionLayer(num_channels)
-        num_channels = num_channels // 2
-
-        # Dense Block 2
-        self.db2 = DenseBlock(
-            num_layers=4,
-            in_channels=num_channels,
-            growth_rate=growth_rate
-        )
-        num_channels += 4 * growth_rate
-        self.trans2 = TransitionLayer(num_channels)
-        num_channels = num_channels // 2
-
-        # Classifier
-        self.global_avg_pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(num_channels, num_classes)
-
-    def forward(self, x):
-        x = self.initial_conv(x)
-        x = self.trans1(self.db1(x))
-        x = self.trans2(self.db2(x))
-        x = self.global_avg_pool(x)
-        x = torch.flatten(x, 1)
-        x = self.fc(x)
+        x = self.features(x)
+        x = self.classifier(x)
         return x
-    
+
 def extract_zip(zip_path, extract_folder="h2-data"):
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
         zip_ref.extractall(extract_folder)
@@ -129,7 +88,6 @@ def extract_zip(zip_path, extract_folder="h2-data"):
     if len(contents) == 1 and os.path.isdir(os.path.join(root, contents[0])):
         root = os.path.join(root, contents[0])
 
-    print(f"Dataset root: {root}")
     return root
 
 class ImageDataset(Dataset):
@@ -144,15 +102,17 @@ class ImageDataset(Dataset):
         self.class_dirs = sorted([
             d for d in os.listdir(root_dir) if d.startswith("n")
         ])
-        print(f"Classes found: {self.class_dirs}")
-        self.class_to_index = {
-            cls: i for i, cls in enumerate(self.class_dirs)
+        self.class_mappings = {
+            "n02124075": 0,
+            "n07753592": 1,
+            "n02504458": 2,
+            "n03792782": 3
         }
 
         self.samples = []
         for filename in self.files:
-            class_name = filename.split("_"[0]) # Ex: n02124075
-            label = self.class_to_index[class_name]
+            class_name = filename.split("_")[0] # Ex: n02124075
+            label = self.class_mappings[class_name]
             full_path = os.path.join(root_dir, class_name, filename)
             self.samples.append((full_path, label))
 
@@ -217,7 +177,7 @@ def train(model, train_loader, epochs, lr):
 
             total_loss += loss.item()
 
-            print(f"Epoch [{epoch}/{epochs}] Loss: {total_loss / len(train_loader):.4f}")
+        print(f"Epoch [{epoch + 1}/{epochs}] Loss: {total_loss / len(train_loader):.4f}")
 
     print("Training Complete")
 
@@ -244,26 +204,25 @@ def test(model, test_loader):
 
 
 if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    start_time = time.time()
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     zip_path = "h2-data.zip"
     dataset_dir = extract_zip(zip_path, extract_folder="h2-data")
-
-    class_mappings = {
-        "n02124075": 0,
-        "n07753592": 1,
-        "n02504458": 2,
-        "n03792782": 3
-    }
-
     train_loader, test_loader = create_dataloaders(
         root_dir=dataset_dir,
         batch_size=32,
         image_size=128
     )
 
-    # model = DenseNet(num_classes=4, growth_rate=32)
+    model = CustomCNN()
 
-    # model = train(model, train_loader, epochs=25, lr=0.001)
-    # test(model, test_loader)
+    model = train(model, train_loader, epochs=8, lr=0.01)
+    test(model, test_loader)
+
+    end_time = time.time()
+    minutes = (end_time - start_time) / 60
+    seconds = (end_time - start_time) % 60
+    print(f"Total execution time: {minutes:.0f} minutes {seconds:.2f} seconds")
